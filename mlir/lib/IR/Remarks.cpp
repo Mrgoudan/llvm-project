@@ -13,6 +13,7 @@
 #include "mlir/IR/Value.h"
 
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/Sequence.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/StringRef.h"
 
@@ -263,13 +264,21 @@ void RemarkEngine::reportImpl(const Remark &remark) {
 }
 
 void RemarkEngine::report(const Remark &&remark) {
-  if (remarkEmittingPolicy)
-    remarkEmittingPolicy->reportRemark(remark);
+  if (!remarkEmittingPolicy)
+    return;
+  llvm::sys::SmartScopedLock<true> lock(mutex);
+  remarkEmittingPolicy->reportRemark(remark);
+}
+
+void RemarkEngine::finalizePolicy() {
+  if (!remarkEmittingPolicy)
+    return;
+  llvm::sys::SmartScopedLock<true> lock(mutex);
+  remarkEmittingPolicy->finalize();
 }
 
 RemarkEngine::~RemarkEngine() {
-  if (remarkEmittingPolicy)
-    remarkEmittingPolicy->finalize();
+  finalizePolicy();
 
   if (remarkStreamer)
     remarkStreamer->finalize();
@@ -366,6 +375,59 @@ namespace mlir::remark {
 RemarkEmittingPolicyAll::RemarkEmittingPolicyAll() = default;
 RemarkEmittingPolicyFinal::RemarkEmittingPolicyFinal() = default;
 
+namespace {
+/// Where RemarkEmittingPolicyFinal::finalize() places a root remark. The
+/// fields depend only on the remark's identity, never on its ID or arguments,
+/// so the order does not depend on which report of an identity was kept or on
+/// the order in which threads reported.
+struct FinalOrderKey {
+  /// Every file position nested in the location, in pre-order walk order. The
+  /// first is the one the diagnostic printer shows; the others tell apart,
+  /// for example, one callee inlined at two call sites.
+  SmallVector<std::tuple<StringRef, unsigned, unsigned>, 2> positions;
+  StringRef remarkName;
+  StringRef categoryName;
+  RemarkKind kind;
+  Location loc;
+  /// The printed location, computed only to break a tie between two
+  /// different locations with the same file positions.
+  mutable std::optional<std::string> printedLoc;
+
+  explicit FinalOrderKey(const detail::Remark &remark)
+      : remarkName(remark.getRemarkName()),
+        categoryName(remark.getCombinedCategoryName()),
+        kind(remark.getRemarkKind()), loc(remark.getLocation()) {
+    loc->walk([&](Location nested) {
+      if (auto flc = dyn_cast<FileLineColLoc>(nested))
+        positions.emplace_back(flc.getFilename().getValue(), flc.getLine(),
+                               flc.getColumn());
+      return WalkResult::advance();
+    });
+  }
+
+  StringRef getPrintedLoc() const {
+    if (!printedLoc) {
+      printedLoc.emplace();
+      llvm::raw_string_ostream os(*printedLoc);
+      os << loc;
+    }
+    return *printedLoc;
+  }
+
+  bool operator<(const FinalOrderKey &other) const {
+    // Remarks without any file position go last.
+    if (positions.empty() != other.positions.empty())
+      return other.positions.empty();
+    auto fields = std::tie(positions, remarkName, categoryName, kind);
+    auto otherFields = std::tie(other.positions, other.remarkName,
+                                other.categoryName, other.kind);
+    if (fields != otherFields)
+      return fields < otherFields;
+    return getPrintedLoc() < other.getPrintedLoc();
+  }
+};
+} // namespace
+
 void RemarkEmittingPolicyFinal::finalize() {
   assert(reportImpl && "reportImpl is not set");
 
@@ -384,14 +446,26 @@ void RemarkEmittingPolicyFinal::finalize() {
       childIds.insert(relId.getValue());
   }
 
-  // Emit remarks with related remarks grouped after their parents.
-  // Parent remarks are emitted first, followed by their related (child)
-  // remarks. Child-only remarks are skipped at the top level to avoid
-  // duplication.
-  for (const detail::Remark &remark : llvm::make_second_range(remarks)) {
+  // Sort the root remarks, those not printed under a parent, by source
+  // position. Sort indices rather than `remarks` itself, since idMap points
+  // into it. The stable sort falls back to first-report order only for two
+  // different locations that print the same.
+  SmallVector<unsigned> roots;
+  SmallVector<FinalOrderKey> keys;
+  for (auto [index, entry] : llvm::enumerate(remarks)) {
+    const detail::Remark &remark = entry.second;
     if (remark.getId() && childIds.contains(remark.getId().getValue()))
       continue; // will be printed grouped under its parent
+    roots.push_back(index);
+    keys.emplace_back(remark);
+  }
+  auto order = llvm::to_vector(llvm::seq<unsigned>(0, roots.size()));
+  llvm::stable_sort(order,
+                    [&](unsigned a, unsigned b) { return keys[a] < keys[b]; });
 
+  // Emit remarks with related remarks grouped after their parents.
+  for (unsigned rootIndex : order) {
+    const detail::Remark &remark = remarks[roots[rootIndex]].second;
     reportImpl(remark);
 
     // Emit related remarks immediately after the parent.

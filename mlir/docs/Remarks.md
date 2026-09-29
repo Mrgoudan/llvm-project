@@ -206,9 +206,14 @@ Stores remarks until `finalize()` is called and emits only the **last** remark
 reported for each identity. This is useful in multi-pass compilers where several
 passes report on the same thing and only the final report should be shown. The
 identity is the location, remark name, combined category name and kind.
-Arguments are never part of it. Root remarks are emitted in the order in which
-their identity was first reported, with linked remarks right after the remark
-that references them, so the output does not depend on hash order.
+Arguments are never part of it.
+
+Root remarks are emitted sorted by source position: by the file positions
+nested in their location, the first of which is the one the diagnostic printer
+shows, then by remark name, category and kind. Remarks whose location holds no
+file position come last. Linked remarks follow right after the remark that
+references them. The order does not depend on the order in which remarks were
+reported, so it is the same whether or not passes run in parallel.
 `finalize()` drains the stored remarks. Calling it again emits only remarks
 reported since.
 
@@ -226,6 +231,26 @@ remark::passed(loc, opts) << "Loop unrolled by 4";
 ```
 
 You can also implement custom policies by inheriting from the policy interface.
+
+### Thread safety
+
+Passes that run in parallel report into the same `RemarkEngine`. The engine
+takes a lock around each call into the policy, so `reportRemark` and
+`finalize`, and the streamer calls a policy makes from them, never run
+concurrently. Custom policies and streamers therefore need no lock of their
+own. They must not report remarks or wait for threads that report remarks,
+and diagnostic handlers must not report remarks either.
+
+To emit the remarks a final policy holds while other threads may still report,
+call `RemarkEngine::finalizePolicy()` rather than calling `finalize()` on
+`getRemarkEmittingPolicy()` directly. The engine destructor finalizes the
+policy as well.
+
+With several threads, some output still depends on scheduling. Under
+`RemarkEmittingPolicyAll`, the streamer receives remarks in the order in which
+threads reach the lock. `RemarkId` and `RelatedTo` values come from a shared
+counter. If two threads report the same identity, whichever reports last
+decides the content the final policy keeps.
 
 ***
 
@@ -321,7 +346,8 @@ remark::enableOptimizationRemarks(
 
 ### Option 3: Custom Streamer
 
-Implement your own backend for specialized output formats:
+Implement your own backend for specialized output formats. The engine calls
+`streamOptimizationRemark` under its lock, so it needs no locking of its own:
 
 ```c++
 class MyStreamer : public MLIRRemarkStreamerBase {
