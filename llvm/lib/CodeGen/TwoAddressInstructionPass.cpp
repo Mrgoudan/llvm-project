@@ -1731,13 +1731,12 @@ bool TwoAddressInstructionImpl::processStatepoint(
       continue;
     }
 
-    unsigned SrcIdx = TO.second[0].first;
     unsigned DstIdx = TO.second[0].second;
 
     MachineOperand &DstMO = MI->getOperand(DstIdx);
     Register RegA = DstMO.getReg();
 
-    assert(RegB == MI->getOperand(SrcIdx).getReg());
+    assert(RegB == MI->getOperand(TO.second[0].first).getReg());
 
     if (RegA == RegB)
       continue;
