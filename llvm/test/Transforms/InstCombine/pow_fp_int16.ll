@@ -256,8 +256,7 @@ define double @pow_uitofp_const_base_fast_i16(i16 %x) {
 define double @pow_uitofp_const_base_2_fast_i16(i16 %x) {
 ; CHECK-LABEL: define double @pow_uitofp_const_base_2_fast_i16(
 ; CHECK-SAME: i16 [[X:%.*]]) {
-; CHECK-NEXT:    [[SUBFP:%.*]] = uitofp i16 [[X]] to float
-; CHECK-NEXT:    [[EXP2:%.*]] = tail call fast float @llvm.exp2.f32(float [[SUBFP]])
+; CHECK-NEXT:    [[EXP2:%.*]] = tail call fast float @llvm.ldexp.f32.i16(float 1.000000e+00, i16 [[X]])
 ; CHECK-NEXT:    [[RES:%.*]] = fpext float [[EXP2]] to double
 ; CHECK-NEXT:    ret double [[RES]]
 ;

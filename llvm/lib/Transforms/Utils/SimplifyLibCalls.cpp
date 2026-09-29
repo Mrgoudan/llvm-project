@@ -2226,16 +2226,18 @@ Value *LibCallSimplifier::optimizeCAbs(CallInst *CI, IRBuilderBase &B) {
 
 // Return a properly extended integer (DstWidth bits wide) if the operation is
 // an itofp.
-static Value *getIntToFPVal(Value *I2F, IRBuilderBase &B, unsigned DstWidth) {
+static Value *getIntToFPVal(Value *I2F, IRBuilderBase &B, unsigned DstWidth,
+                            bool AllowFullWidthUnsigned = false) {
   if (isa<SIToFPInst>(I2F) || isa<UIToFPInst>(I2F)) {
     Value *Op = cast<Instruction>(I2F)->getOperand(0);
     // Make sure that the exponent fits inside an "int" of size DstWidth,
     // thus avoiding any range issues that FP has not.
     unsigned BitWidth = Op->getType()->getScalarSizeInBits();
-    if (BitWidth < DstWidth || (BitWidth == DstWidth && isa<SIToFPInst>(I2F))) {
+    bool IsSigned = isa<SIToFPInst>(I2F);
+    if (BitWidth < DstWidth ||
+        (BitWidth == DstWidth && (IsSigned || AllowFullWidthUnsigned))) {
       Type *IntTy = Op->getType()->getWithNewBitWidth(DstWidth);
-      return isa<SIToFPInst>(I2F) ? B.CreateSExt(Op, IntTy)
-                                  : B.CreateZExt(Op, IntTy);
+      return IsSigned ? B.CreateSExt(Op, IntTy) : B.CreateZExt(Op, IntTy);
     }
   }
 
@@ -2637,7 +2639,11 @@ Value *LibCallSimplifier::optimizeExp2(CallInst *CI, IRBuilderBase &B) {
   if ((isa<SIToFPInst>(Op) || isa<UIToFPInst>(Op)) &&
       (UseIntrinsic ||
        hasFloatFn(M, TLI, Ty, LibFunc_ldexp, LibFunc_ldexpf, LibFunc_ldexpl))) {
-    if (Value *Exp = getIntToFPVal(Op, B, TLI->getIntSize())) {
+    // x >= 2^(IntSize-1) makes exp2 overflow to inf, which is poison under
+    // ninf.
+    bool AllowFullWidthUnsigned = UseIntrinsic && CI->hasNoInfs();
+    if (Value *Exp =
+            getIntToFPVal(Op, B, TLI->getIntSize(), AllowFullWidthUnsigned)) {
       Constant *One = ConstantFP::get(Ty, 1.0);
 
       if (UseIntrinsic) {
